@@ -56,9 +56,10 @@ There are **two different files** involved:
 | File | Purpose | Created by |
 | ---- | ------- | ---------- |
 | `credentials.json` | OAuth **client** (app identity) | **You**, via Google Cloud Console |
-| `token.json` | OAuth **user token** (login result) | **Script**, after first authorization |
+| `token.json` | OAuth **user token** (login result) | `create_token.py`, after first authorization |
 
-The script **cannot create `credentials.json`**, but **will create `token.json` automatically**.
+The project **cannot create `credentials.json`**. Create that in Google Cloud
+Console, then run `create_token.py` once to create `token.json`.
 
 ---
 
@@ -99,6 +100,24 @@ While still on the consent screen:
 > This is required. Otherwise Google will block login with  
 > “app is being tested”.
 
+### Publishing status and refresh-token lifetime
+
+For long-running use, set the OAuth consent screen publishing status to
+**In production** after your test login works.
+
+If the OAuth app remains **External / Testing**, Google can issue refresh tokens
+that expire after **7 days** for non-basic scopes such as:
+
+```text
+https://www.googleapis.com/auth/contacts.readonly
+```
+
+When that happens, the server logs an `invalid_grant` refresh error and you must
+run `create_token.py` again. Moving the consent screen to **In production**
+avoids the Testing-mode 7-day refresh-token lifetime. For personal use, you may
+still see an unverified-app warning during login, but you can continue for your
+own account.
+
 ---
 
 ## Step 4 — Create OAuth credentials (`credentials.json`)
@@ -122,30 +141,33 @@ credentials.json
 
 ## Step 5 — First run (token creation)
 
-Start the server:
+Create `token.json` on a machine with a browser:
+
+```bash
+python3 create_token.py
+```
+
+The token creation script will:
+- open your browser
+- Log in with your Google account
+- Approve access
+- create `token.json`
+
+You should see log output like:
+
+```text
+Starting OAuth browser flow
+Saved token.json
+```
+
+After that, start the server:
 
 ```bash
 python3 birthdays_server.py
 ```
 
-On **first run only**:
-- Open stated URL in a browser window on the same machine
-- Log in with your Google account
-- Approve access
-
-The script will:
-- create `token.json`
-- store it locally
-- reuse it on future starts
-- refresh it automatically
-
-You should see log output like:
-
-```text
-OAuth authorization completed (startup)
-Saved token.json (startup)
-Google People API service ready
-```
+The server reuses `token.json` and refreshes it automatically. It does not start
+OAuth login itself.
 
 ---
 
@@ -153,21 +175,44 @@ Google People API service ready
 
 ### Recommended approach
 
-1. Run the script **once on a machine with a browser**
-2. Let it create `token.json`
-3. Copy both files to the server:
+1. Create `token.json` on a machine with a browser:
+
+```bash
+python3 create_token.py
+```
+
+2. Copy both files to the server:
 
 ```bash
 scp credentials.json token.json user@server:/path/to/app/
 ```
 
-4. Start the server on the headless system:
+3. Start the server on the headless system:
 
 ```bash
 python3 birthdays_server.py
 ```
 
 As long as `token.json` exists, **no UI is needed anymore**.
+
+The server never starts a new OAuth login. If the token is missing or revoked,
+it exits with instructions to run `create_token.py` again on a UI machine.
+
+### If token refresh fails with `invalid_grant`
+
+`invalid_grant: Bad Request` means Google no longer accepts the saved refresh token.
+Common causes are a revoked token, changed OAuth credentials, account security changes,
+or an OAuth consent app that is still in testing.
+
+Delete `token.json` and authorize again:
+
+```bash
+rm token.json
+python3 create_token.py
+```
+
+Then copy the new `token.json` back to the headless server if you created it on
+another machine.
 
 ---
 
@@ -183,6 +228,7 @@ Adjust paths if needed:
 ```text
 /home/google-birthdays/
 ├── birthdays_server.py
+├── create_token.py
 ├── credentials.json
 ├── token.json
 ├── requirements.txt
@@ -261,15 +307,15 @@ journalctl -u google-birthdays -f
 
 ### First-time OAuth on servers
 
-`systemd` cannot complete the first OAuth login. Do this once (on a machine with a browser),
-or run it once manually as the service user if a browser is available:
+`systemd` cannot complete OAuth login. Create `token.json` on a machine with a
+browser:
 
 ```bash
-cd /home/google-birthdays
-sudo -u googlebirthdays .venv/bin/python birthdays_server.py
+python3 create_token.py
 ```
 
-This creates `token.json`. After that, start the systemd service normally.
+Then copy `credentials.json` and `token.json` to `/home/google-birthdays/` and
+start the systemd service normally.
 
 > Headless servers: create `token.json` on a UI machine, then copy `token.json` + `credentials.json` to the server.
 
@@ -285,6 +331,29 @@ http://<host>:8080/birthdays.ics
 Add this URL to any calendar app as a **subscribed calendar**.
 
 Calendar clients will refresh automatically (typically every 30–120 minutes).
+
+The default feed filename is `birthdays.ics`. Override it with `ICS_FILENAME`:
+
+```bash
+ICS_FILENAME=family-birthdays.ics python3 birthdays_server.py
+```
+
+Then subscribe to:
+
+```text
+http://<host>:8080/family-birthdays.ics
+```
+
+`ICS_FILENAME` accepts either `family-birthdays` or `family-birthdays.ics`.
+If the `.ics` suffix is missing, the server adds it automatically.
+
+## Configuration
+
+| Variable | Default | Used by | Purpose |
+| -------- | ------- | ------- | ------- |
+| `GOOGLE_OAUTH_CREDENTIALS` | `credentials.json` | `create_token.py`, `birthdays_server.py` | Path to the OAuth client JSON from Google Cloud Console |
+| `GOOGLE_OAUTH_TOKEN` | `token.json` | `create_token.py`, `birthdays_server.py` | Path to the saved user token |
+| `ICS_FILENAME` | `birthdays.ics` | `birthdays_server.py` | Feed filename/path served by the HTTP server |
 
 ## _OPTIONAL:_ Reverse proxy with Caddy (Docker)
 
@@ -337,7 +406,7 @@ docker logs -f caddy-birthdays
 Test the endpoint:
 
 ```bash
-curl -I http://localhost/birthdays.ics
+curl -I http://localhost:8080/birthdays.ics
 ```
 
 ---
@@ -372,7 +441,12 @@ token.json
 
 - Google does **not** provide an official birthdays export
 - This workaround is currently the **only reliable solution**
-- OAuth consent screen will remain in *Testing* (fine for personal use)
+- Google OAuth device-code flow does **not** support the required People API
+  contacts scope, so token creation uses a Desktop app OAuth client and a
+  browser-capable machine
+- OAuth consent screen **Testing** mode can make refresh tokens expire after
+  **7 days** for the required contacts scope; use **In production** for
+  long-running personal use
 
 ---
 

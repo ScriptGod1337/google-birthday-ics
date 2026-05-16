@@ -9,8 +9,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from icalendar import Calendar, Event
@@ -23,6 +23,12 @@ log = logging.getLogger("birthdays")
 SCOPES = ["https://www.googleapis.com/auth/contacts.readonly"]
 CREDENTIALS_JSON = Path(os.getenv("GOOGLE_OAUTH_CREDENTIALS", "credentials.json"))
 TOKEN_JSON = Path(os.getenv("GOOGLE_OAUTH_TOKEN", "token.json"))
+ICS_FILENAME = os.getenv("ICS_FILENAME", "birthdays.ics").strip().lstrip("/")
+if not ICS_FILENAME:
+    ICS_FILENAME = "birthdays.ics"
+if not ICS_FILENAME.endswith(".ics"):
+    ICS_FILENAME = f"{ICS_FILENAME}.ics"
+ICS_PATH = f"/{ICS_FILENAME}"
 
 FALLBACK_YEAR = 1970
 LEAP_YEAR = 1972
@@ -46,11 +52,24 @@ Do this once:
    - Application type: "Desktop app"
 4) Download the JSON and save it as: {CREDENTIALS_JSON}
 
-Then run the script again. On first start it will open a browser to authorize
-and create {TOKEN_JSON} automatically.
+Then run create_token.py on a machine with a browser to create {TOKEN_JSON}.
+"""
+    sys.stderr.write(msg.strip() + "\n")
+    sys.exit(2)
 
-Tip: If you run this on a headless server, do the first run on a machine with a browser
-and copy token.json to the server.
+
+def print_token_help_and_exit(reason: str) -> None:
+    msg = f"""
+[ERROR] {reason}
+
+This server does not run OAuth login. Create a fresh token on a machine with a
+browser, then copy it to this server:
+
+    python3 create_token.py
+
+Expected files:
+  OAuth client: {CREDENTIALS_JSON}
+  User token:   {TOKEN_JSON}
 """
     sys.stderr.write(msg.strip() + "\n")
     sys.exit(2)
@@ -69,23 +88,23 @@ def ensure_service_at_startup():
     if TOKEN_JSON.exists():
         log.info("Found existing token.json")
         creds = Credentials.from_authorized_user_file(str(TOKEN_JSON), SCOPES)
+    else:
+        print_token_help_and_exit(f"Missing OAuth token file: {TOKEN_JSON}")
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             log.info("Refreshing expired OAuth token (startup)")
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except RefreshError:
+                print_token_help_and_exit(
+                    "Google rejected the saved OAuth refresh token. "
+                    "Run create_token.py again to re-authorize."
+                )
         else:
-            log.warning("No valid OAuth token found – opening browser login (startup)")
-            flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_JSON), SCOPES)
-            creds = flow.run_local_server(
-                host="127.0.0.1",
-                port=8080,
-                open_browser=False,
-                authorization_prompt_message="Open this URL on your laptop (with SSH tunnel active): {url}",
-                success_message="Auth complete. You may close this tab.",
-                timeout_seconds=300,
+            print_token_help_and_exit(
+                f"OAuth token is invalid and cannot be refreshed: {TOKEN_JSON}"
             )
-            log.info("OAuth authorization completed (startup)")
 
         TOKEN_JSON.write_text(creds.to_json(), encoding="utf-8")
         log.info("Saved token.json (startup)")
@@ -158,7 +177,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         log.info("HTTP request: %s %s", self.command, self.path)
 
-        if self.path != "/birthdays.ics":
+        if self.path != ICS_PATH:
             self.send_error(404)
             return
 
@@ -183,6 +202,6 @@ if __name__ == "__main__":
 
     host, port = "0.0.0.0", 8080
     log.info("Starting HTTP server on %s:%s", host, port)
-    log.info("Endpoint: http://%s:%s/birthdays.ics", host, port)
+    log.info("Endpoint: http://%s:%s%s", host, port, ICS_PATH)
 
     HTTPServer((host, port), Handler).serve_forever()
